@@ -124,6 +124,7 @@ import android.provider.MediaStore;
 import android.provider.Settings;
 import android.service.notification.Adjustment;
 import android.service.notification.NotificationListenerService;
+import android.service.notification.NotificationRankingUpdate;
 import android.service.notification.NotificationStats;
 import android.service.notification.StatusBarNotification;
 import android.service.notification.ZenPolicy;
@@ -149,6 +150,7 @@ import com.android.server.SystemService;
 import com.android.server.UiServiceTestCase;
 import com.android.server.lights.Light;
 import com.android.server.lights.LightsManager;
+import com.android.server.notification.ManagedServices.ManagedServiceInfo;
 import com.android.server.notification.NotificationManagerService.NotificationAssistants;
 import com.android.server.notification.NotificationManagerService.NotificationListeners;
 import com.android.server.pm.PackageManagerService;
@@ -255,6 +257,8 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
     @Mock
     AlarmManager mAlarmManager;
 
+    private NotificationManagerService.WorkerHandler mWorkerHandler;
+
     // Use a Testable subclass so we can simulate calls from the system without failing.
     private static class TestableNotificationManagerService extends NotificationManagerService {
         int countSystemChecks = 0;
@@ -263,6 +267,9 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         int countLogSmartSuggestionsVisible = 0;
         @Nullable
         NotificationAssistantAccessGrantedCallback mNotificationAssistantAccessGrantedCallback;
+
+        @Nullable
+        Boolean mIsVisibleToListenerReturnValue = null;
 
         TestableNotificationManagerService(Context context) {
             super(context);
@@ -331,6 +338,18 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
                 String packageName) {
             // Tests for this not being true are in CTS NotificationManagerTest
             return true;
+	}
+
+        protected void setIsVisibleToListenerReturnValue(boolean value) {
+            mIsVisibleToListenerReturnValue = value;
+        }
+
+        @Override
+        boolean isVisibleToListener(StatusBarNotification sbn, ManagedServiceInfo listener) {
+            if (mIsVisibleToListenerReturnValue != null) {
+                return mIsVisibleToListenerReturnValue;
+            }
+            return super.isVisibleToListener(sbn, listener);
         }
 
         class StrongAuthTrackerFake extends NotificationManagerService.StrongAuthTracker {
@@ -428,9 +447,15 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
 
         when(mAssistants.isAdjustmentAllowed(anyString())).thenReturn(true);
 
+<<<<<<< HEAD
 
         mService.init(mTestableLooper.getLooper(),
                 mPackageManager, mPackageManagerClient, mockLightsManager,
+=======
+        mWorkerHandler = spy(mService.new WorkerHandler(mTestableLooper.getLooper()));
+        mService.init(mWorkerHandler,
+                mRankingHandler, mPackageManager, mPackageManagerClient, mockLightsManager,
+>>>>>>> 523926b137a6... Enable user graularity for lockdown mode
                 mListeners, mAssistants, mConditionProviders,
                 mCompanionMgr, mSnoozeHelper, mUsageStats, mPolicyFile, mActivityManager,
                 mGroupHelper, mAm, mAppUsageStats,
@@ -459,6 +484,7 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         clearDeviceConfig();
         InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation().dropShellPermissionIdentity();
+        mWorkerHandler.removeCallbacksAndMessages(null);
     }
 
     public void waitForIdle() {
@@ -5607,10 +5633,10 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         mStrongAuthTracker.setGetStrongAuthForUserReturnValue(
                 STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN);
         mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
-        assertTrue(mStrongAuthTracker.isInLockDownMode());
-        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(0);
+        assertTrue(mStrongAuthTracker.isInLockDownMode(mContext.getUserId()));
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(mContext.getUserId());
         mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
-        assertFalse(mStrongAuthTracker.isInLockDownMode());
+        assertFalse(mStrongAuthTracker.isInLockDownMode(mContext.getUserId()));
     }
 
     @Test
@@ -5626,8 +5652,8 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         // when entering the lockdown mode, cancel the 2 notifications.
         mStrongAuthTracker.setGetStrongAuthForUserReturnValue(
                 STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN);
-        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
-        assertTrue(mStrongAuthTracker.isInLockDownMode());
+        mStrongAuthTracker.onStrongAuthRequiredChanged(0);
+        assertTrue(mStrongAuthTracker.isInLockDownMode(0));
 
         // the notifyRemovedLocked function is called twice due to REASON_LOCKDOWN.
         ArgumentCaptor<Integer> captor = ArgumentCaptor.forClass(Integer.class);
@@ -5636,9 +5662,44 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
 
         // exit lockdown mode.
         mStrongAuthTracker.setGetStrongAuthForUserReturnValue(0);
-        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
+        mStrongAuthTracker.onStrongAuthRequiredChanged(0);
+        assertFalse(mStrongAuthTracker.isInLockDownMode(0));
 
         // the notifyPostedLocked function is called twice.
-        verify(mListeners, times(2)).notifyPostedLocked(any(), any());
+        verify(mWorkerHandler, times(2)).postDelayed(any(Runnable.class), anyLong());
+    }
+
+    @Test
+    public void testMakeRankingUpdateLockedInLockDownMode() {
+        // post 2 notifications from a same package
+        NotificationRecord pkgA = new NotificationRecord(mContext,
+                generateSbn("a", 1000, 9, 0), mTestNotificationChannel);
+        mService.addNotification(pkgA);
+        NotificationRecord pkgB = new NotificationRecord(mContext,
+                generateSbn("a", 1000, 9, 1), mTestNotificationChannel);
+        mService.addNotification(pkgB);
+
+        mService.setIsVisibleToListenerReturnValue(true);
+        NotificationRankingUpdate nru = mService.makeRankingUpdateLocked(null);
+        assertEquals(2, nru.getRankingMap().getOrderedKeys().length);
+
+        // when only user 0 entering the lockdown mode, its notification will be suppressed.
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(
+                STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(0);
+        assertTrue(mStrongAuthTracker.isInLockDownMode(0));
+        assertFalse(mStrongAuthTracker.isInLockDownMode(1));
+
+        nru = mService.makeRankingUpdateLocked(null);
+        assertEquals(1, nru.getRankingMap().getOrderedKeys().length);
+
+        // User 0 exits lockdown mode. Its notification will be resumed.
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(0);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(0);
+        assertFalse(mStrongAuthTracker.isInLockDownMode(0));
+        assertFalse(mStrongAuthTracker.isInLockDownMode(1));
+
+        nru = mService.makeRankingUpdateLocked(null);
+        assertEquals(2, nru.getRankingMap().getOrderedKeys().length);
     }
 }
